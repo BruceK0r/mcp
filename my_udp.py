@@ -3,6 +3,7 @@ import logging
 import socket
 import threading
 import math
+import time
 
 class VehicleData:
     def __init__(self):
@@ -24,6 +25,9 @@ class UDPClient:
         self.vehicle_data = VehicleData()
         self.neighbor_vehicle_data = []
         self.vehicle_name = vehicle_name
+        self.packet_count = 0
+        self.last_packet_time = 0.0
+        self.last_seen_vehicle_names = []
 
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.DEBUG)
@@ -38,12 +42,16 @@ class UDPClient:
 
     def receive(self):
         while True:
-            data0, addr = self.sock.recvfrom(10240)
-            data1 = data0.decode()
-
-            data = json.loads(data1)
             try:
-                for vehicle in data['vehicles']:
+                data0, addr = self.sock.recvfrom(10240)
+                data1 = data0.decode()
+                data = json.loads(data1)
+                vehicles = data.get('vehicles', [])
+                self.packet_count += 1
+                self.last_packet_time = time.time()
+                self.last_seen_vehicle_names = [vehicle.get('name', '') for vehicle in vehicles]
+
+                for vehicle in vehicles:
                     if vehicle['name'] == self.vehicle_name:
                         self.vehicle_data.name = vehicle['name']
                         self.vehicle_data.x = vehicle['x']
@@ -51,7 +59,7 @@ class UDPClient:
                         self.vehicle_data.yaw = vehicle['yaw']
                         self.vehicle_data.speed = vehicle['speed']
                         self.neighbor_vehicle_data = []
-                        for other_vehicle in data['vehicles']:
+                        for other_vehicle in vehicles:
                             if other_vehicle['name'] != self.vehicle_name:
                                 neighbor_vehicle = VehicleData()
                                 neighbor_vehicle.name = other_vehicle['name']
@@ -72,6 +80,13 @@ class UDPClient:
     
     def get_neighbor_vehicle_state(self):
         return self.neighbor_vehicle_data
+
+    def get_debug_status(self):
+        return {
+            "packet_count": self.packet_count,
+            "last_packet_time": self.last_packet_time,
+            "last_seen_vehicle_names": list(self.last_seen_vehicle_names),
+        }
 
     def send_control_command(self, v, w):
         message = '{"name":"' + self.vehicle_name + '","vx":%f,"vz":%f}' % (v, w)
