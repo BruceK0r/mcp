@@ -78,6 +78,8 @@ class RuntimeDebugLogger:
         self._trajectory_writer = None
         self._terminal_lock = threading.RLock()
         self._trajectory_lock = threading.RLock()
+        self._last_trajectory_flush = 0.0
+        self._trajectory_flush_interval = self._read_flush_interval()
         self._closed = False
 
     def start(self):
@@ -93,10 +95,11 @@ class RuntimeDebugLogger:
         self.metadata_path = os.path.join(self.run_dir, "metadata.json")
 
         self._terminal_file = open(self.terminal_log_path, "a", encoding="utf-8", buffering=1)
-        self._trajectory_file = open(self.trajectory_log_path, "a", encoding="utf-8", newline="", buffering=1)
+        self._trajectory_file = open(self.trajectory_log_path, "a", encoding="utf-8", newline="", buffering=8192)
         self._trajectory_writer = csv.DictWriter(self._trajectory_file, fieldnames=self.TRAJECTORY_FIELDS)
         if self._trajectory_file.tell() == 0:
             self._trajectory_writer.writeheader()
+            self._trajectory_file.flush()
 
         self._stdout = sys.stdout
         self._stderr = sys.stderr
@@ -138,6 +141,8 @@ class RuntimeDebugLogger:
         with self._trajectory_lock:
             try:
                 self._trajectory_writer.writerow(row)
+                if self._should_flush_trajectory(now):
+                    self._trajectory_file.flush()
             except ValueError:
                 # File was closed during interpreter shutdown.
                 pass
@@ -178,3 +183,23 @@ class RuntimeDebugLogger:
         if value != value or value in (float("inf"), float("-inf")):
             return ""
         return f"{value:.{precision}f}"
+
+    def _read_flush_interval(self):
+        raw_value = os.environ.get("DEBUG_LOG_FLUSH_INTERVAL", "1.0")
+        try:
+            interval = float(raw_value)
+        except (TypeError, ValueError):
+            return 1.0
+        if interval != interval or interval < 0.0:
+            return 1.0
+        return interval
+
+    def _should_flush_trajectory(self, now):
+        if self._trajectory_file is None:
+            return False
+        if self._trajectory_flush_interval <= 0.0:
+            return True
+        if now - self._last_trajectory_flush < self._trajectory_flush_interval:
+            return False
+        self._last_trajectory_flush = now
+        return True

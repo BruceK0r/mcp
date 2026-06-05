@@ -84,7 +84,11 @@ class Control:
         self._has_valid_index = False
 
         self.control_rate = 10  # hz
-        self.dt = 1.0 / self.control_rate
+        self.nominal_dt = 1.0 / self.control_rate
+        self.dt = self.nominal_dt
+        self.min_control_dt = 0.08
+        self.max_control_dt = 0.16
+        self._last_loop_monotonic = None
         self.wheel_base = 2.7
 
         # Runtime choices. Keep python main.py unchanged; override with env vars when needed.
@@ -96,22 +100,22 @@ class Control:
 
         # Safety and smoothing limits. The competition rule forbids v >= 20 m/s.
         self.max_speed = 18.0
-        self.cruise_speed = 17.0
+        self.cruise_speed = 16.0
         self.min_tracking_speed = 3.0
         self.max_steer_angle = math.radians(32.0)
         self.max_w = 1.45
         self.max_accel = 6.0
         self.max_decel = 10.0
-        self.max_w_rate = 3.2
-        self.max_lateral_accel = 5.6
+        self.max_w_rate = 2.0
+        self.max_lateral_accel = 4.5
         self.last_cmd_v = 0.0
         self.last_cmd_w = 0.0
 
         # Tracking parameters.
-        self.lookahead_min = 5.0
-        self.lookahead_max = 16.0
-        self.lookahead_gain = 0.45
-        self.curvature_preview_distance = 24.0
+        self.lookahead_min = 5.5
+        self.lookahead_max = 13.5
+        self.lookahead_gain = 0.35
+        self.curvature_preview_distance = 30.0
         self.curvature_sample_step = 3.0
         self.relocalize_distance = 14.0
         self.local_search_back = 25
@@ -119,12 +123,15 @@ class Control:
 
         # Lightweight MPC-like parameters. Horizon is short enough for 10 Hz control.
         self.mpc_horizon = 10
-        self.mpc_position_weight = 2.2
-        self.mpc_heading_weight = 1.0
+        self.mpc_position_weight = 0.8
+        self.mpc_heading_weight = 1.3
+        self.mpc_cte_weight = 6.5
+        self.mpc_inside_weight = 4.5
+        self.mpc_terminal_weight = 8.0
         self.mpc_speed_weight = 2.0
-        self.mpc_yaw_rate_weight = 0.12
-        self.mpc_delta_v_weight = 0.45
-        self.mpc_delta_w_weight = 0.85
+        self.mpc_yaw_rate_weight = 0.18
+        self.mpc_delta_v_weight = 0.55
+        self.mpc_delta_w_weight = 3.2
 
     def control_node(self):
         route_loaded = self.load_route(self.route_file)
@@ -133,7 +140,7 @@ class Control:
         self._write_debug_metadata(route_loaded)
 
         while True:
-            start_time = time.time()
+            start_monotonic, loop_time_ms = self._begin_control_cycle()
             self.cycle_count += 1
             vehicle_data = self.udp_client.get_vehicle_state()
             state_valid = self._update_vehicle_state(vehicle_data)
@@ -147,12 +154,12 @@ class Control:
                     route_ready=route_ready,
                     v=v,
                     w=w,
-                    start_time=start_time,
                     calc_time_ms=0.0,
+                    loop_time_ms=loop_time_ms,
                     status="fallback"
                 )
                 self.udp_client.send_control_command(v, w)
-                self._sleep_until_next_cycle(start_time)
+                self._sleep_until_next_cycle(start_monotonic)
                 continue
 
             self.update_vehpos_index()
@@ -171,12 +178,12 @@ class Control:
                 route_ready=route_ready,
                 v=v,
                 w=w,
-                start_time=start_time,
                 calc_time_ms=calc_time_ms,
+                loop_time_ms=loop_time_ms,
                 status="tracking"
             )
             self.udp_client.send_control_command(v, w)
-            self._sleep_until_next_cycle(start_time)
+            self._sleep_until_next_cycle(start_monotonic)
 
     def load_route(self, file_path):
         self._clear_route()
@@ -273,19 +280,32 @@ class Control:
                 progress = 0.0
                 cost = self._control_effort_cost(candidate_v, candidate_w, desired_speed)
 
+                terminal_cte = 0.0
                 for _ in range(self.mpc_horizon):
                     x += candidate_v * math.cos(yaw) * self.dt
                     y += candidate_v * math.sin(yaw) * self.dt
                     yaw = normalize_angle(yaw + candidate_w * self.dt)
                     progress += max(candidate_v, 0.0) * self.dt
 
-                    ref_x, ref_y, ref_yaw, _, _ = self._reference_at_s(start_s + progress)
-                    pos_error = math.hypot(x - ref_x, y - ref_y)
+                    ref_x, ref_y, ref_yaw, ref_curvature, _ = self._reference_at_s(start_s + progress)
+                    longitudinal_error, cross_track_error = self._reference_frame_errors(
+                        x,
+                        y,
+                        ref_x,
+                        ref_y,
+                        ref_yaw
+                    )
                     heading_error = normalize_angle(yaw - ref_yaw)
+                    inside_error = self._inside_cut_error(cross_track_error, ref_curvature)
+                    curve_gain = self._curve_cost_gain(ref_curvature)
 
-                    cost += self.mpc_position_weight * pos_error * pos_error
+                    cost += self.mpc_position_weight * longitudinal_error * longitudinal_error
+                    cost += self.mpc_cte_weight * cross_track_error * cross_track_error
+                    cost += self.mpc_inside_weight * curve_gain * inside_error * inside_error
                     cost += self.mpc_heading_weight * heading_error * heading_error
-                    cost += self.mpc_speed_weight * ((candidate_v - desired_speed) / self.max_speed) ** 2
+                    terminal_cte = cross_track_error
+
+                cost += self.mpc_terminal_weight * terminal_cte * terminal_cte
 
                 if cost < best_cost:
                     best_cost = cost
@@ -299,10 +319,14 @@ class Control:
             return 0.0
 
         nearest_index = self._valid_index(nearest_index)
-        path_yaw = self.path_yaws[nearest_index]
-        cross_track_error = abs(self._cross_track_error(m_x, m_y, nearest_index))
-        heading_error = abs(normalize_angle(m_yaw - path_yaw))
-        max_curvature = self._max_abs_curvature_ahead(nearest_index, self.curvature_preview_distance)
+        ref_x, ref_y, ref_yaw, ref_curvature, _ = self._reference_at_s(self._s_at_index(nearest_index))
+        _, signed_cte = self._reference_frame_errors(m_x, m_y, ref_x, ref_y, ref_yaw)
+        cross_track_error = abs(signed_cte)
+        heading_error = abs(normalize_angle(m_yaw - ref_yaw))
+        max_curvature = max(
+            abs(ref_curvature),
+            self._max_abs_curvature_ahead(nearest_index, self.curvature_preview_distance)
+        )
 
         if max_curvature < 1e-4:
             curve_speed = self.max_speed
@@ -310,12 +334,26 @@ class Control:
             curve_speed = math.sqrt(self.max_lateral_accel / max_curvature)
 
         speed = min(self.cruise_speed, curve_speed, self.max_speed)
-        cte_factor = clamp(1.0 - 0.08 * cross_track_error, 0.45, 1.0)
-        heading_factor = clamp(1.0 - 0.45 * heading_error, 0.45, 1.0)
+        cte_factor = clamp(1.0 - 0.10 * cross_track_error, 0.35, 1.0)
+        heading_factor = clamp(1.0 - 0.60 * heading_error, 0.40, 1.0)
         speed *= cte_factor * heading_factor
 
-        if cross_track_error > 4.0 or heading_error > math.radians(60.0):
-            speed = min(speed, 6.0)
+        if cross_track_error > 0.6:
+            cte_speed_cap = clamp(
+                self.cruise_speed - 1.3 * (cross_track_error - 0.6),
+                6.0,
+                self.cruise_speed
+            )
+            speed = min(speed, cte_speed_cap)
+
+        if max_curvature > 0.01 and cross_track_error > 1.0:
+            speed = min(speed, max(self.min_tracking_speed, curve_speed * 0.85))
+
+        if cross_track_error > 3.0 or heading_error > math.radians(45.0):
+            speed = min(speed, 7.0)
+
+        if cross_track_error > 5.0 or heading_error > math.radians(60.0):
+            speed = min(speed, 5.5)
 
         return clamp(speed, self.min_tracking_speed, self.max_speed)
 
@@ -380,8 +418,14 @@ class Control:
         self.target_index = target_index
 
     def _build_speed_candidates(self, desired_speed):
+        desired_speed = clamp(desired_speed, 0.0, self.max_speed)
         lower = max(0.0, self.last_cmd_v - self.max_decel * self.dt)
-        upper = min(self.max_speed, self.last_cmd_v + self.max_accel * self.dt)
+        rate_upper = min(self.max_speed, self.last_cmd_v + self.max_accel * self.dt)
+        if desired_speed >= self.last_cmd_v:
+            upper = min(rate_upper, desired_speed * 1.03 + 0.15)
+        else:
+            upper = min(rate_upper, self.last_cmd_v)
+        upper = max(lower, upper)
         raw_values = [
             lower,
             upper,
@@ -389,25 +433,26 @@ class Control:
             desired_speed * 0.70,
             desired_speed * 0.85,
             desired_speed,
-            desired_speed * 1.05,
+            desired_speed * 1.03,
             self.m_v,
         ]
         return self._unique_sorted(clamp(v, lower, upper) for v in raw_values)
 
     def _build_yaw_rate_candidates(self, pure_pursuit_w):
+        if not math.isfinite(pure_pursuit_w):
+            pure_pursuit_w = self.last_cmd_w
+        pure_pursuit_w = clamp(pure_pursuit_w, -self.max_w, self.max_w)
+
         lower = max(-self.max_w, self.last_cmd_w - self.max_w_rate * self.dt)
         upper = min(self.max_w, self.last_cmd_w + self.max_w_rate * self.dt)
-        raw_values = [
-            lower,
-            upper,
-            self.last_cmd_w,
-            pure_pursuit_w - 0.45,
-            pure_pursuit_w - 0.25,
-            pure_pursuit_w,
-            pure_pursuit_w + 0.25,
-            pure_pursuit_w + 0.45,
-            0.0,
-        ]
+        center = clamp(0.65 * self.last_cmd_w + 0.35 * pure_pursuit_w, lower, upper)
+        step = clamp(0.45 * self.max_w_rate * max(self.dt, self.min_control_dt), 0.04, 0.10)
+        raw_values = [lower, upper, self.last_cmd_w, pure_pursuit_w, center]
+        for offset in range(-4, 5):
+            raw_values.append(center + offset * step)
+
+        if lower <= 0.0 <= upper and abs(center) < 0.12 and abs(pure_pursuit_w) < 0.20:
+            raw_values.append(0.0)
         return self._unique_sorted(clamp(w, lower, upper) for w in raw_values)
 
     def _control_effort_cost(self, candidate_v, candidate_w, desired_speed):
@@ -482,9 +527,26 @@ class Control:
         except Exception:
             return False
 
-    def _sleep_until_next_cycle(self, start_time):
-        elapsed_time = time.time() - start_time
-        sleep_time = max(self.dt - elapsed_time, 0.0)
+    def _begin_control_cycle(self):
+        now = time.monotonic()
+        if self._last_loop_monotonic is None:
+            self._last_loop_monotonic = now
+            self.dt = self.nominal_dt
+            return now, self.nominal_dt * 1000.0
+
+        raw_dt = now - self._last_loop_monotonic
+        self._last_loop_monotonic = now
+        if math.isfinite(raw_dt) and raw_dt > 0.0:
+            self.dt = clamp(raw_dt, self.min_control_dt, self.max_control_dt)
+            loop_time_ms = raw_dt * 1000.0
+        else:
+            self.dt = self.nominal_dt
+            loop_time_ms = self.nominal_dt * 1000.0
+        return now, loop_time_ms
+
+    def _sleep_until_next_cycle(self, start_monotonic):
+        elapsed_time = time.monotonic() - start_monotonic
+        sleep_time = max(self.nominal_dt - elapsed_time, 0.0)
         time.sleep(sleep_time)
 
     def _write_debug_metadata(self, route_loaded):
@@ -499,6 +561,8 @@ class Control:
             "route_loaded": route_loaded,
             "controller": self.controller_mode,
             "control_rate_hz": self.control_rate,
+            "dt_min": self.min_control_dt,
+            "dt_max": self.max_control_dt,
             "max_speed": self.max_speed,
             "cruise_speed": self.cruise_speed,
             "max_w": self.max_w,
@@ -509,6 +573,13 @@ class Control:
             "lookahead_max": self.lookahead_max,
             "lookahead_gain": self.lookahead_gain,
             "mpc_horizon": self.mpc_horizon,
+            "mpc_position_weight": self.mpc_position_weight,
+            "mpc_heading_weight": self.mpc_heading_weight,
+            "mpc_cte_weight": self.mpc_cte_weight,
+            "mpc_inside_weight": self.mpc_inside_weight,
+            "mpc_terminal_weight": self.mpc_terminal_weight,
+            "mpc_yaw_rate_weight": self.mpc_yaw_rate_weight,
+            "mpc_delta_w_weight": self.mpc_delta_w_weight,
         })
 
     def _warn_fallback_reason(self, state_valid, route_ready):
@@ -546,7 +617,7 @@ class Control:
                 "fix NET_CONFIG or VEHICLE_NAME."
             )
 
-    def _log_trajectory(self, state_valid, route_ready, v, w, start_time, calc_time_ms, status):
+    def _log_trajectory(self, state_valid, route_ready, v, w, calc_time_ms, loop_time_ms, status):
         if self.debug_logger is None:
             return
 
@@ -585,7 +656,7 @@ class Control:
             heading_error_rad=heading_error,
             path_curvature=path_curvature,
             calc_time_ms=calc_time_ms,
-            loop_time_ms=(time.time() - start_time) * 1000.0,
+            loop_time_ms=loop_time_ms,
         )
 
     def _clear_route(self):
@@ -752,6 +823,9 @@ class Control:
             s = clamp(s, 0.0, self.path_length)
 
         segment_count = len(self.segment_lengths)
+        if segment_count <= 0 or len(self.cumulative_lengths) < 2:
+            return self.m_x, self.m_y, self.m_yaw, 0.0, -1
+
         segment_index = bisect.bisect_right(self.cumulative_lengths, s) - 1
         segment_index = int(clamp(segment_index, 0, segment_count - 1))
         next_index = (segment_index + 1) % len(self.X_points) if self.closed_path else min(segment_index + 1, len(self.X_points) - 1)
@@ -766,18 +840,53 @@ class Control:
         y1 = self.Y_points[next_index]
         ref_x = x0 + ratio * (x1 - x0)
         ref_y = y0 + ratio * (y1 - y0)
-        ref_yaw = math.atan2(y1 - y0, x1 - x0)
+        yaw0 = self.path_yaws[segment_index] if segment_index < len(self.path_yaws) else math.atan2(y1 - y0, x1 - x0)
+        yaw1 = self.path_yaws[next_index] if next_index < len(self.path_yaws) else yaw0
+        ref_yaw = normalize_angle(yaw0 + ratio * normalize_angle(yaw1 - yaw0))
         if not math.isfinite(ref_yaw):
-            ref_yaw = self.path_yaws[segment_index]
-        ref_curvature = self.path_curvatures[segment_index]
+            ref_yaw = yaw0 if math.isfinite(yaw0) else 0.0
+
+        curvature0 = self.path_curvatures[segment_index] if segment_index < len(self.path_curvatures) else 0.0
+        curvature1 = self.path_curvatures[next_index] if next_index < len(self.path_curvatures) else curvature0
+        ref_curvature = curvature0 + ratio * (curvature1 - curvature0)
+        if not math.isfinite(ref_curvature):
+            ref_curvature = 0.0
         return ref_x, ref_y, ref_yaw, ref_curvature, segment_index
 
     def _cross_track_error(self, x, y, nearest_index):
+        if not self._route_ready():
+            return 0.0
         nearest_index = self._valid_index(nearest_index)
         path_yaw = self.path_yaws[nearest_index]
         dx = x - self.X_points[nearest_index]
         dy = y - self.Y_points[nearest_index]
         return -math.sin(path_yaw) * dx + math.cos(path_yaw) * dy
+
+    def _reference_frame_errors(self, x, y, ref_x, ref_y, ref_yaw):
+        values = (x, y, ref_x, ref_y, ref_yaw)
+        if not all(math.isfinite(value) for value in values):
+            return 0.0, 0.0
+
+        dx = x - ref_x
+        dy = y - ref_y
+        cos_yaw = math.cos(ref_yaw)
+        sin_yaw = math.sin(ref_yaw)
+        longitudinal_error = cos_yaw * dx + sin_yaw * dy
+        cross_track_error = -sin_yaw * dx + cos_yaw * dy
+        return longitudinal_error, cross_track_error
+
+    def _inside_cut_error(self, cross_track_error, curvature):
+        if not (math.isfinite(cross_track_error) and math.isfinite(curvature)):
+            return 0.0
+        if abs(curvature) < 1e-4:
+            return 0.0
+        inside_error = cross_track_error if curvature > 0.0 else -cross_track_error
+        return max(inside_error, 0.0)
+
+    def _curve_cost_gain(self, curvature):
+        if not math.isfinite(curvature):
+            return 0.0
+        return clamp(abs(curvature) / 0.03, 0.0, 1.0)
 
     def _max_abs_curvature_ahead(self, start_index, distance):
         if not self._route_ready():
