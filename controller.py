@@ -17,14 +17,14 @@ class ControllerConfig:
         self.curvature_speed_gain = 55.0
         self.speed_filter_alpha = 0.35
 
-        self.max_steer = math.radians(32.0)
-        self.max_steer_rate = math.radians(95.0)
-        self.max_yaw_rate = 1.35
+        self.max_steer = math.radians(28.0)
+        self.max_steer_rate = math.radians(55.0)
+        self.max_yaw_rate = 0.72
 
-        self.lookahead_base = 3.2
-        self.lookahead_gain = 0.42
-        self.lookahead_min = 3.0
-        self.lookahead_max = 12.5
+        self.lookahead_base = 1.8
+        self.lookahead_gain = 0.60
+        self.lookahead_min = 2.8
+        self.lookahead_max = 13.5
 
         self.pid_kp = 0.42
         self.pid_ki = 0.04
