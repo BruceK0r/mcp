@@ -25,6 +25,11 @@ class ControllerConfig:
         self.lookahead_gain = 0.60
         self.lookahead_min = 2.8
         self.lookahead_max = 13.5
+        self.curvature_preview_distance = 8.0
+        self.curvature_lookahead_gain = 4.0
+        self.curvature_lookahead_min_factor = 0.60
+        self.curvature_feedforward_gain = 0.35
+        self.curvature_feedforward_limit = math.radians(8.0)
 
         self.pid_kp = 0.42
         self.pid_ki = 0.04
@@ -135,7 +140,8 @@ class PurePursuitController:
         if n == 0:
             return LateralControlResult(0.0, 0.0, 0, 0.0, 0.0, 0.0, x, y)
 
-        lookahead = self._lookahead(current_speed)
+        preview_curvature = self._preview_curvature(reference, nearest_idx, self.config.curvature_preview_distance)
+        lookahead = self._lookahead(current_speed, preview_curvature)
         target_idx = self._advance_index(reference, nearest_idx, lookahead)
         target_idx = self._avoid_rear_target(reference, target_idx, x, y, yaw)
         target = points[target_idx]
@@ -149,6 +155,12 @@ class PurePursuitController:
         ld2 = max(local_x * local_x + local_y * local_y, 1e-6)
 
         steering = math.atan2(2.0 * self.config.wheel_base * local_y, ld2)
+        steering += clamp(
+            self.config.curvature_feedforward_gain
+            * math.atan(self.config.wheel_base * preview_curvature),
+            -self.config.curvature_feedforward_limit,
+            self.config.curvature_feedforward_limit,
+        )
         steering = clamp(steering, -self.config.max_steer, self.config.max_steer)
 
         max_delta = self.config.max_steer_rate * max(dt, 1e-3)
@@ -181,12 +193,42 @@ class PurePursuitController:
             target.y,
         )
 
-    def _lookahead(self, speed):
-        return clamp(
+    def _lookahead(self, speed, preview_curvature=0.0):
+        speed_lookahead = clamp(
             self.config.lookahead_base + self.config.lookahead_gain * abs(float(speed)),
             self.config.lookahead_min,
             self.config.lookahead_max,
         )
+        curvature_factor = 1.0 / (
+            1.0 + self.config.curvature_lookahead_gain * abs(float(preview_curvature))
+        )
+        curvature_factor = clamp(curvature_factor, self.config.curvature_lookahead_min_factor, 1.0)
+        return clamp(
+            speed_lookahead * curvature_factor,
+            self.config.lookahead_min,
+            self.config.lookahead_max,
+        )
+
+    def _preview_curvature(self, reference, start_idx, distance):
+        points = reference.points
+        n = len(points)
+        if n == 0:
+            return 0.0
+
+        idx = max(0, min(n - 1, int(start_idx)))
+        best_curvature = points[idx].curvature
+        traveled = 0.0
+        for _ in range(n):
+            next_idx = (idx + 1) % n if reference.closed else min(idx + 1, n - 1)
+            if next_idx == idx:
+                break
+            traveled += math.hypot(points[next_idx].x - points[idx].x, points[next_idx].y - points[idx].y)
+            idx = next_idx
+            if abs(points[idx].curvature) > abs(best_curvature):
+                best_curvature = points[idx].curvature
+            if traveled >= distance:
+                break
+        return best_curvature
 
     def _advance_index(self, reference, start_idx, distance):
         points = reference.points
