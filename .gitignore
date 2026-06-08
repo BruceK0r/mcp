@@ -1,12 +1,8 @@
 __pycache__/
 *.py[cod]
-*$py.class
 
-.idea/
+log/
+run_route/
+
 .DS_Store
-
-.venv/
-venv/
-env/
-
-logs/
+.idea/

@@ -1,205 +1,146 @@
-import atexit
 import csv
+import atexit
 import json
+import math
 import os
-import sys
-import threading
 import time
-from datetime import datetime
 
 
-class TeeStream:
-    def __init__(self, primary_stream, log_file, lock):
-        self.primary_stream = primary_stream
-        self.log_file = log_file
-        self.lock = lock
-        self.encoding = getattr(primary_stream, "encoding", "utf-8")
+class DebugLogger:
+    def __init__(
+        self,
+        control_log_enabled=True,
+        trajectory_log_enabled=True,
+        log_dir="log",
+        run_route_dir="run_route",
+        log_every_n_frames=3,
+        route_save_every_n_frames=3,
+        enabled=None,
+        interval=None,
+    ):
+        if enabled is not None:
+            control_log_enabled = bool(enabled)
 
-    def write(self, text):
-        with self.lock:
-            self.primary_stream.write(text)
-            self.log_file.write(text)
-        return len(text)
-
-    def flush(self):
-        with self.lock:
-            self.primary_stream.flush()
-            self.log_file.flush()
-
-    def isatty(self):
-        return self.primary_stream.isatty()
-
-    def fileno(self):
-        return self.primary_stream.fileno()
-
-
-class RuntimeDebugLogger:
-    TRAJECTORY_FIELDS = [
-        "wall_time",
-        "elapsed_s",
-        "cycle",
-        "vehicle_name",
-        "route_file",
-        "controller",
-        "state_valid",
-        "route_ready",
-        "status",
-        "x",
-        "y",
-        "yaw_rad",
-        "yaw_deg",
-        "speed_mps",
-        "cmd_v",
-        "cmd_w",
-        "nearest_index",
-        "target_index",
-        "target_x",
-        "target_y",
-        "cross_track_error",
-        "heading_error_rad",
-        "path_curvature",
-        "calc_time_ms",
-        "loop_time_ms",
-    ]
-
-    def __init__(self, base_dir="logs", enabled=True):
-        self.enabled = enabled and os.environ.get("DEBUG_LOG_ENABLED", "1") != "0"
-        self.base_dir = base_dir
-        self.run_dir = None
-        self.terminal_log_path = None
-        self.trajectory_log_path = None
-        self.metadata_path = None
-
-        self._started_at = time.time()
-        self._stdout = None
-        self._stderr = None
-        self._terminal_file = None
-        self._trajectory_file = None
-        self._trajectory_writer = None
-        self._terminal_lock = threading.RLock()
-        self._trajectory_lock = threading.RLock()
-        self._last_trajectory_flush = 0.0
-        self._trajectory_flush_interval = self._read_flush_interval()
+        self.control_log_enabled = bool(control_log_enabled)
+        self.trajectory_log_enabled = bool(trajectory_log_enabled)
+        self.log_dir = log_dir
+        self.run_route_dir = run_route_dir
+        self.log_every_n_frames = max(1, int(log_every_n_frames))
+        self.route_save_every_n_frames = max(1, int(route_save_every_n_frames))
+        self.frame = 0
+        self._control_file = None
+        self._control_writer = None
+        self._trajectory_path = None
+        self._trajectory_points = []
         self._closed = False
 
-    def start(self):
-        if not self.enabled:
-            return self
-
-        run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
-        self.run_dir = os.path.join(self.base_dir, run_name)
-        os.makedirs(self.run_dir, exist_ok=True)
-
-        self.terminal_log_path = os.path.join(self.run_dir, "terminal.log")
-        self.trajectory_log_path = os.path.join(self.run_dir, "trajectory.csv")
-        self.metadata_path = os.path.join(self.run_dir, "metadata.json")
-
-        self._terminal_file = open(self.terminal_log_path, "a", encoding="utf-8", buffering=1)
-        self._trajectory_file = open(self.trajectory_log_path, "a", encoding="utf-8", newline="", buffering=8192)
-        self._trajectory_writer = csv.DictWriter(self._trajectory_file, fieldnames=self.TRAJECTORY_FIELDS)
-        if self._trajectory_file.tell() == 0:
-            self._trajectory_writer.writeheader()
-            self._trajectory_file.flush()
-
-        self._stdout = sys.stdout
-        self._stderr = sys.stderr
-        sys.stdout = TeeStream(self._stdout, self._terminal_file, self._terminal_lock)
-        sys.stderr = TeeStream(self._stderr, self._terminal_file, self._terminal_lock)
-
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        if self.control_log_enabled:
+            os.makedirs(self.log_dir, exist_ok=True)
+            self._control_file = open(
+                os.path.join(self.log_dir, "control_%s.csv" % stamp),
+                "w",
+                newline="",
+                encoding="utf-8",
+                buffering=1,
+            )
+            self._control_writer = csv.DictWriter(self._control_file, fieldnames=self._control_fields())
+            self._control_writer.writeheader()
+        if self.trajectory_log_enabled:
+            os.makedirs(self.run_route_dir, exist_ok=True)
+            self._trajectory_path = os.path.join(self.run_route_dir, "run_route_%s.json" % stamp)
+            self._save_trajectory()
         atexit.register(self.close)
-        print("debug log dir:", self.run_dir)
-        return self
 
-    def write_metadata(self, data):
-        if not self.enabled or not self.metadata_path:
-            return
-        payload = {
-            "started_at": datetime.fromtimestamp(self._started_at).isoformat(timespec="seconds"),
-            "run_dir": self.run_dir,
-        }
-        payload.update(data or {})
-        try:
-            with open(self.metadata_path, "w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False, indent=2)
-        except OSError as exc:
-            print("failed to write debug metadata:", exc)
-
-    def log_trajectory(self, **kwargs):
-        if not self.enabled or self._trajectory_writer is None or self._closed:
-            return
-
+    def log(self, data):
+        self.frame += 1
         now = time.time()
-        row = {field: "" for field in self.TRAJECTORY_FIELDS}
-        row["wall_time"] = datetime.fromtimestamp(now).isoformat(timespec="milliseconds")
-        row["elapsed_s"] = self._format_float(now - self._started_at, 3)
 
-        for key, value in kwargs.items():
-            if key not in row:
-                continue
-            row[key] = self._format_value(value)
+        if self.trajectory_log_enabled and self._trajectory_path is not None:
+            self._trajectory_points.append(
+                {
+                    "x": round(float(data.get("x", 0.0)), 6),
+                    "y": round(float(data.get("y", 0.0)), 6),
+                }
+            )
+            if self.frame % self.route_save_every_n_frames == 0:
+                self._save_trajectory()
 
-        with self._trajectory_lock:
-            try:
-                self._trajectory_writer.writerow(row)
-                if self._should_flush_trajectory(now):
-                    self._trajectory_file.flush()
-            except ValueError:
-                # File was closed during interpreter shutdown.
-                pass
+        if not self.control_log_enabled or self._control_writer is None:
+            return
+        if self.frame % self.log_every_n_frames != 0:
+            return
+
+        self._control_writer.writerow(
+            {
+                "timestamp": "%.6f" % now,
+                "frame": self.frame,
+                "x": self._fmt(data.get("x", 0.0)),
+                "y": self._fmt(data.get("y", 0.0)),
+                "yaw_rad": self._fmt(data.get("yaw", 0.0)),
+                "yaw_deg": self._fmt(math.degrees(data.get("yaw", 0.0))),
+                "speed": self._fmt(data.get("speed", 0.0)),
+                "nearest_index": data.get("index", 0),
+                "target_index": data.get("target_index", 0),
+                "target_x": self._fmt(data.get("target_x", 0.0)),
+                "target_y": self._fmt(data.get("target_y", 0.0)),
+                "cross_track_error": self._fmt(data.get("cross_track_error", 0.0)),
+                "heading_error": self._fmt(data.get("heading_error", 0.0)),
+                "curvature": self._fmt(data.get("curvature", 0.0)),
+                "target_speed": self._fmt(data.get("target_speed", 0.0)),
+                "v_cmd": self._fmt(data.get("v_cmd", 0.0)),
+                "w_cmd": self._fmt(data.get("w_cmd", 0.0)),
+                "steering_angle": self._fmt(data.get("steering_angle", 0.0)),
+            }
+        )
 
     def close(self):
         if self._closed:
             return
         self._closed = True
 
-        if self._stdout is not None:
-            sys.stdout = self._stdout
-        if self._stderr is not None:
-            sys.stderr = self._stderr
+        if self._control_file is not None and not self._control_file.closed:
+            self._control_file.flush()
+            self._control_file.close()
 
-        for file_obj in (self._trajectory_file, self._terminal_file):
-            if file_obj is None:
-                continue
-            try:
-                file_obj.flush()
-                file_obj.close()
-            except OSError:
-                pass
+        if self.trajectory_log_enabled and self._trajectory_path is not None:
+            self._save_trajectory()
 
-    def _format_value(self, value):
-        if isinstance(value, float):
-            return self._format_float(value)
-        if isinstance(value, bool):
-            return int(value)
-        if value is None:
-            return ""
-        return value
+    def __del__(self):
+        self.close()
 
-    def _format_float(self, value, precision=6):
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return ""
-        if value != value or value in (float("inf"), float("-inf")):
-            return ""
-        return f"{value:.{precision}f}"
+    def _fmt(self, value):
+        return "%.6f" % float(value)
 
-    def _read_flush_interval(self):
-        raw_value = os.environ.get("DEBUG_LOG_FLUSH_INTERVAL", "1.0")
-        try:
-            interval = float(raw_value)
-        except (TypeError, ValueError):
-            return 1.0
-        if interval != interval or interval < 0.0:
-            return 1.0
-        return interval
+    def _save_trajectory(self):
+        if self._trajectory_path is None:
+            return
+        tmp_path = self._trajectory_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file_obj:
+            json.dump(self._trajectory_points, file_obj, ensure_ascii=False, indent=2)
+            file_obj.write("\n")
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+        os.replace(tmp_path, self._trajectory_path)
 
-    def _should_flush_trajectory(self, now):
-        if self._trajectory_file is None:
-            return False
-        if self._trajectory_flush_interval <= 0.0:
-            return True
-        if now - self._last_trajectory_flush < self._trajectory_flush_interval:
-            return False
-        self._last_trajectory_flush = now
-        return True
+    def _control_fields(self):
+        return [
+            "timestamp",
+            "frame",
+            "x",
+            "y",
+            "yaw_rad",
+            "yaw_deg",
+            "speed",
+            "nearest_index",
+            "target_index",
+            "target_x",
+            "target_y",
+            "cross_track_error",
+            "heading_error",
+            "curvature",
+            "target_speed",
+            "v_cmd",
+            "w_cmd",
+            "steering_angle",
+        ]
